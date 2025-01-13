@@ -1,6 +1,7 @@
 package dmverity
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
@@ -12,19 +13,29 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/Microsoft/hcsshim/ext4/internal/compactext4"
+	"github.com/Microsoft/hcsshim/internal/memory"
 )
 
 const (
 	blockSize = compactext4.BlockSize
-	// RecommendedVHDSizeGB is the recommended size in GB for VHDs, which is not a hard limit. 
-	RecommendedVHDSizeGB = 128 * 1024 * 1024 * 1024
+	// MerkleTreeBufioSize is a default buffer size to use with bufio.Reader
+	MerkleTreeBufioSize = memory.MiB // 1MB
+	// RecommendedVHDSizeGB is the recommended size in GB for VHDs, which is not a hard limit.
+	RecommendedVHDSizeGB = 128 * memory.GiB
+	// VeritySignature is a value written to dm-verity super-block.
+	VeritySignature = "verity"
 )
-var salt = bytes.Repeat([]byte{0}, 32)
+
+var (
+	salt   = bytes.Repeat([]byte{0}, 32)
+	sbSize = binary.Size(dmveritySuperblock{})
+)
 
 var (
 	ErrSuperBlockReadFailure  = errors.New("failed to read dm-verity super block")
 	ErrSuperBlockParseFailure = errors.New("failed to parse dm-verity super block")
 	ErrRootHashReadFailure    = errors.New("failed to read dm-verity root hash")
+	ErrNotVeritySuperBlock    = errors.New("invalid dm-verity super-block signature")
 )
 
 type dmveritySuperblock struct {
@@ -69,37 +80,42 @@ type VerityInfo struct {
 	Version       uint32
 }
 
-// MerkleTree constructs dm-verity hash-tree for a given byte array with a fixed salt (0-byte) and algorithm (sha256).
-func MerkleTree(data []byte) ([]byte, error) {
+// MerkleTree constructs dm-verity hash-tree for a given io.Reader with a fixed salt (0-byte) and algorithm (sha256).
+func MerkleTree(r io.Reader) ([]byte, error) {
 	layers := make([][]byte, 0)
+	currentLevel := r
 
-	currentLevel := bytes.NewBuffer(data)
-
-	for currentLevel.Len() != blockSize {
-		blocks := currentLevel.Len() / blockSize
+	for {
 		nextLevel := bytes.NewBuffer(make([]byte, 0))
-
-		for i := 0; i < blocks; i++ {
+		for {
 			block := make([]byte, blockSize)
-			_, err := currentLevel.Read(block)
-			if err != nil {
+			if _, err := io.ReadFull(currentLevel, block); err != nil {
+				if err == io.EOF {
+					break
+				}
 				return nil, errors.Wrap(err, "failed to read data block")
 			}
 			h := hash2(salt, block)
 			nextLevel.Write(h)
 		}
 
-		padding := bytes.Repeat([]byte{0}, blockSize-(nextLevel.Len()%blockSize))
-		nextLevel.Write(padding)
+		if nextLevel.Len()%blockSize != 0 {
+			padding := bytes.Repeat([]byte{0}, blockSize-(nextLevel.Len()%blockSize))
+			nextLevel.Write(padding)
+		}
 
-		currentLevel = nextLevel
-		layers = append(layers, currentLevel.Bytes())
+		layers = append(layers, nextLevel.Bytes())
+		currentLevel = bufio.NewReaderSize(nextLevel, MerkleTreeBufioSize)
+
+		// This means that only root hash remains and our job is done
+		if nextLevel.Len() == blockSize {
+			break
+		}
 	}
 
-	var tree = bytes.NewBuffer(make([]byte, 0))
+	tree := bytes.NewBuffer(make([]byte, 0))
 	for i := len(layers) - 1; i >= 0; i-- {
-		_, err := tree.Write(layers[i])
-		if err != nil {
+		if _, err := tree.Write(layers[i]); err != nil {
 			return nil, errors.Wrap(err, "failed to write merkle tree")
 		}
 	}
@@ -125,7 +141,7 @@ func NewDMVeritySuperblock(size uint64) *dmveritySuperblock {
 		SaltSize:      uint16(len(salt)),
 	}
 
-	copy(superblock.Signature[:], "verity")
+	copy(superblock.Signature[:], VeritySignature)
 	copy(superblock.Algorithm[:], "sha256")
 	copy(superblock.Salt[:], salt)
 
@@ -162,27 +178,41 @@ func ReadDMVerityInfo(vhdPath string, offsetInBytes int64) (*VerityInfo, error) 
 		return nil, errors.Errorf("failed to seek dm-verity super block: expected bytes=%d, actual=%d", offsetInBytes, s)
 	}
 
+	return ReadDMVerityInfoReader(vhd)
+}
+
+func ReadDMVerityInfoReader(r io.Reader) (*VerityInfo, error) {
 	block := make([]byte, blockSize)
-	if s, err := vhd.Read(block); err != nil || s != blockSize {
+	if s, err := r.Read(block); err != nil || s != blockSize {
 		if err != nil {
-			return nil, errors.Wrapf(ErrSuperBlockReadFailure, "%s", err)
+			// TODO (go1.20): use multierror via fmt.Errorf("...: %w; ...: %w", ...)
+			//nolint:errorlint // non-wrapping format verb for fmt.Errorf
+			return nil, fmt.Errorf("%s: %w", ErrSuperBlockReadFailure, err)
 		}
-		return nil, errors.Wrapf(ErrSuperBlockReadFailure, "unexpected bytes read: expected=%d, actual=%d", blockSize, s)
+		return nil, fmt.Errorf("unexpected bytes read expected=%d actual=%d: %w", blockSize, s, ErrSuperBlockReadFailure)
 	}
 
 	dmvSB := &dmveritySuperblock{}
 	b := bytes.NewBuffer(block)
 	if err := binary.Read(b, binary.LittleEndian, dmvSB); err != nil {
-		return nil, errors.Wrapf(ErrSuperBlockParseFailure, "%s", err)
+		// TODO (go1.20): use multierror via fmt.Errorf("...: %w; ...: %w", ...)
+		//nolint:errorlint // non-wrapping format verb for fmt.Errorf
+		return nil, fmt.Errorf("%s: %w", ErrSuperBlockParseFailure, err)
 	}
 
-	// read the merkle tree root
-	if s, err := vhd.Read(block); err != nil || s != blockSize {
-		if err != nil {
-			return nil, errors.Wrapf(ErrRootHashReadFailure, "%s", err)
-		}
-		return nil, errors.Wrapf(ErrRootHashReadFailure, "unexpected bytes read: expected=%d, actual=%d", blockSize, s)
+	if string(bytes.Trim(dmvSB.Signature[:], "\x00")[:]) != VeritySignature {
+		return nil, ErrNotVeritySuperBlock
 	}
+
+	if s, err := r.Read(block); err != nil || s != blockSize {
+		if err != nil {
+			// TODO (go1.20): use multierror via fmt.Errorf("...: %w; ...: %w", ...)
+			//nolint:errorlint // non-wrapping format verb for fmt.Errorf
+			return nil, fmt.Errorf("%s: %w", ErrRootHashReadFailure, err)
+		}
+		return nil, fmt.Errorf("unexpected bytes read expected=%d, actual=%d: %w", blockSize, s, ErrRootHashReadFailure)
+	}
+
 	rootHash := hash2(dmvSB.Salt[:dmvSB.SaltSize], block)
 	return &VerityInfo{
 		RootDigest:         fmt.Sprintf("%x", rootHash),
@@ -195,4 +225,50 @@ func ReadDMVerityInfo(vhdPath string, offsetInBytes int64) (*VerityInfo, error) 
 		HashBlockSize:      blockSize,
 		Version:            dmvSB.Version,
 	}, nil
+}
+
+// ComputeAndWriteHashDevice builds merkle tree from a given io.ReadSeeker and
+// writes the result hash device (dm-verity super-block combined with merkle
+// tree) to io.Writer.
+func ComputeAndWriteHashDevice(r io.ReadSeeker, w io.Writer) error {
+	// save current reader position
+	currBytePos, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+
+	// reset to the beginning to find the device size
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	tree, err := MerkleTree(r)
+	if err != nil {
+		return errors.Wrap(err, "failed to build merkle tree")
+	}
+
+	devSize, err := r.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+
+	// reset reader to initial position
+	if _, err := r.Seek(currBytePos, io.SeekStart); err != nil {
+		return err
+	}
+
+	dmVeritySB := NewDMVeritySuperblock(uint64(devSize))
+	if err := binary.Write(w, binary.LittleEndian, dmVeritySB); err != nil {
+		return errors.Wrap(err, "failed to write dm-verity super-block")
+	}
+	// write super-block padding
+	padding := bytes.Repeat([]byte{0}, blockSize-(sbSize%blockSize))
+	if _, err = w.Write(padding); err != nil {
+		return err
+	}
+	// write tree
+	if _, err := w.Write(tree); err != nil {
+		return errors.Wrap(err, "failed to write merkle tree")
+	}
+	return nil
 }

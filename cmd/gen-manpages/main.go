@@ -23,9 +23,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/containerd/containerd/cmd/containerd/command"
-	"github.com/containerd/containerd/cmd/ctr/app"
-	"github.com/urfave/cli"
+	"github.com/containerd/containerd/v2/cmd/containerd/command"
+	"github.com/containerd/containerd/v2/cmd/ctr/app"
+	"github.com/urfave/cli/v2"
 )
 
 func main() {
@@ -43,11 +43,10 @@ func run() error {
 	}
 	dir := flag.Arg(1)
 
-	parts := strings.SplitN(flag.Arg(0), ".", 2)
-	if len(parts) != 2 {
+	name, section, ok := strings.Cut(flag.Arg(0), ".")
+	if !ok {
 		return fmt.Errorf("invalid name '%s': name does not contain man page section", flag.Arg(0))
 	}
-	name, section := parts[0], parts[1]
 
 	appName, ok := apps[name]
 	if !ok {

@@ -20,15 +20,14 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
-	"unsafe"
 
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/services/server"
+	"github.com/containerd/containerd/v2/cmd/containerd/server"
+	"github.com/containerd/errdefs"
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
-	exec "golang.org/x/sys/execabs"
+	"github.com/urfave/cli/v2"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/debug"
@@ -43,7 +42,6 @@ var (
 	logFileFlag           string
 
 	kernel32     = windows.NewLazySystemDLL("kernel32.dll")
-	setStdHandle = kernel32.NewProc("SetStdHandle")
 	allocConsole = kernel32.NewProc("AllocConsole")
 	oldStderr    windows.Handle
 	panicFile    *os.File
@@ -55,25 +53,25 @@ const defaultServiceName = "containerd"
 // as a Windows service under control of SCM.
 func serviceFlags() []cli.Flag {
 	return []cli.Flag{
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "service-name",
 			Usage: "Set the Windows service name",
 			Value: defaultServiceName,
 		},
-		cli.BoolFlag{
+		&cli.BoolFlag{
 			Name:  "register-service",
 			Usage: "Register the service and exit",
 		},
-		cli.BoolFlag{
+		&cli.BoolFlag{
 			Name:  "unregister-service",
 			Usage: "Unregister the service and exit",
 		},
-		cli.BoolFlag{
+		&cli.BoolFlag{
 			Name:   "run-service",
 			Usage:  "",
 			Hidden: true,
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "log-file",
 			Usage: "Path to the containerd log file",
 		},
@@ -81,8 +79,8 @@ func serviceFlags() []cli.Flag {
 }
 
 // applyPlatformFlags applies platform-specific flags.
-func applyPlatformFlags(context *cli.Context) {
-	serviceNameFlag = context.GlobalString("service-name")
+func applyPlatformFlags(cliContext *cli.Context) {
+	serviceNameFlag = cliContext.String("service-name")
 	if serviceNameFlag == "" {
 		serviceNameFlag = defaultServiceName
 	}
@@ -103,9 +101,9 @@ func applyPlatformFlags(context *cli.Context) {
 			d:    &runServiceFlag,
 		},
 	} {
-		*v.d = context.GlobalBool(v.name)
+		*v.d = cliContext.Bool(v.name)
 	}
-	logFileFlag = context.GlobalString("log-file")
+	logFileFlag = cliContext.String("log-file")
 }
 
 type handler struct {
@@ -155,38 +153,14 @@ func registerService() error {
 	}
 	defer s.Close()
 
-	// See http://stackoverflow.com/questions/35151052/how-do-i-configure-failure-actions-of-a-windows-service-written-in-go
-	const (
-		scActionNone    = 0
-		scActionRestart = 1
-
-		serviceConfigFailureActions = 2
+	return s.SetRecoveryActions(
+		[]mgr.RecoveryAction{
+			{Type: mgr.ServiceRestart, Delay: 15 * time.Second},
+			{Type: mgr.ServiceRestart, Delay: 15 * time.Second},
+			{Type: mgr.NoAction},
+		},
+		uint32(24*time.Hour/time.Second),
 	)
-
-	type serviceFailureActions struct {
-		ResetPeriod  uint32
-		RebootMsg    *uint16
-		Command      *uint16
-		ActionsCount uint32
-		Actions      uintptr
-	}
-
-	type scAction struct {
-		Type  uint32
-		Delay uint32
-	}
-	t := []scAction{
-		{Type: scActionRestart, Delay: uint32(15 * time.Second / time.Millisecond)},
-		{Type: scActionRestart, Delay: uint32(15 * time.Second / time.Millisecond)},
-		{Type: scActionNone},
-	}
-	lpInfo := serviceFailureActions{ResetPeriod: uint32(24 * time.Hour / time.Second), ActionsCount: uint32(3), Actions: uintptr(unsafe.Pointer(&t[0]))}
-	err = windows.ChangeServiceConfig2(s.Handle, serviceConfigFailureActions, (*byte)(unsafe.Pointer(&lpInfo)))
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
 func unregisterService() error {
@@ -307,16 +281,17 @@ func launchService(s *server.Server, done chan struct{}) error {
 		done:    done,
 	}
 
-	interactive, err := svc.IsAnInteractiveSession() // nolint:staticcheck
+	// Check if we're running as a Windows service or interactively.
+	isService, err := svc.IsWindowsService()
 	if err != nil {
 		return err
 	}
 
 	go func() {
-		if interactive {
-			err = debug.Run(serviceNameFlag, h)
-		} else {
+		if isService {
 			err = svc.Run(serviceNameFlag, h)
+		} else {
+			err = debug.Run(serviceNameFlag, h)
 		}
 		h.fromsvc <- err
 	}()
@@ -379,27 +354,19 @@ func initPanicFile(path string) error {
 	// Update STD_ERROR_HANDLE to point to the panic file so that Go writes to
 	// it when it panics. Remember the old stderr to restore it before removing
 	// the panic file.
-	sh := uint32(windows.STD_ERROR_HANDLE)
-	h, err := windows.GetStdHandle(sh)
+	h, err := windows.GetStdHandle(windows.STD_ERROR_HANDLE)
 	if err != nil {
 		return err
 	}
-
 	oldStderr = h
 
-	r, _, err := setStdHandle.Call(uintptr(sh), panicFile.Fd())
-	if r == 0 && err != nil {
-		return err
-	}
-
-	return nil
+	return windows.SetStdHandle(windows.STD_ERROR_HANDLE, windows.Handle(panicFile.Fd()))
 }
 
 func removePanicFile() {
 	if st, err := panicFile.Stat(); err == nil {
 		if st.Size() == 0 {
-			sh := uint32(windows.STD_ERROR_HANDLE)
-			setStdHandle.Call(uintptr(sh), uintptr(oldStderr))
+			windows.SetStdHandle(windows.STD_ERROR_HANDLE, oldStderr)
 			panicFile.Close()
 			os.Remove(panicFile.Name())
 		}

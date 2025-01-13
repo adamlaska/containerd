@@ -25,12 +25,11 @@ compile_fuzzers() {
     local compile_fuzzer=$2
     local blocklist=$3
 
-    for line in $(git grep --full-name "$regex" | grep -v -E "$blocklist")
-    do
+    for line in $(git grep --full-name "$regex" | grep -v -E "$blocklist"); do
         if [[ "$line" =~ (.*)/.*:.*(Fuzz[A-Za-z0-9]+) ]]; then
             local pkg=${BASH_REMATCH[1]}
             local func=${BASH_REMATCH[2]}
-            "$compile_fuzzer" "github.com/containerd/containerd/$pkg" "$func" "fuzz_$func"
+            "$compile_fuzzer" "github.com/containerd/containerd/v2/$pkg" "$func" "fuzz_$func"
         else
             echo "failed to parse: $line"
             exit 1
@@ -38,29 +37,34 @@ compile_fuzzers() {
     done
 }
 
+# This is from https://github.com/AdamKorcz/instrumentation
+cd $SRC/instrumentation
+go run main.go --target_dir $SRC/containerd/images
+
 apt-get update && apt-get install -y wget
 cd $SRC
-wget --quiet https://go.dev/dl/go1.19.linux-amd64.tar.gz
+wget --quiet https://go.dev/dl/go1.23.4.linux-amd64.tar.gz
 
 mkdir temp-go
 rm -rf /root/.go/*
-tar -C temp-go/ -xzf go1.19.linux-amd64.tar.gz
+tar -C temp-go/ -xzf go1.23.4.linux-amd64.tar.gz
 mv temp-go/go/* /root/.go/
 cd $SRC/containerd
 
+printf "package client\nimport _ \"github.com/AdamKorcz/go-118-fuzz-build/testing\"\n" > client/registerfuzzdep.go
 go mod tidy
-rm vendor/github.com/cilium/ebpf/internal/btf/fuzz.go
-rm /root/go/pkg/mod/github.com/cilium/ebpf@v0.7.0/internal/btf/fuzz.go
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 cd ../../
 
 rm -r vendor
 
+# Add temporary CXXFLAGS
+OLDCXXFLAGS=$CXXFLAGS
+export CXXFLAGS="$CXXFLAGS -lresolv"
+
 # Change path of socket since OSS-fuzz does not grant access to /run
 sed -i 's/\/run\/containerd/\/tmp\/containerd/g' $SRC/containerd/defaults/defaults_unix.go
-
-go get github.com/AdamKorcz/go-118-fuzz-build/utils
 
 compile_fuzzers '^func Fuzz.*testing\.F' compile_native_go_fuzzer vendor
 compile_fuzzers '^func Fuzz.*data' compile_go_fuzzer '(vendor|Integ)'
@@ -75,7 +79,7 @@ export GOARCH=amd64
 
 # Build runc
 cd $SRC/
-git clone https://github.com/opencontainers/runc --branch release-1.0
+git clone https://github.com/opencontainers/runc --branch release-1.1
 cd runc
 make
 make install
@@ -92,11 +96,10 @@ sed -i 's/\/run\/containerd-test/\/tmp\/containerd-test/g' $SRC/containerd/integ
 
 cd integration/client
 
-# Rename all *_test.go to *_test_fuzz.go to use their declarations:
-for i in $( ls *_test.go ); do mv $i ./${i%.*}_fuzz.go; done
+compile_fuzzers '^func FuzzInteg.*testing\.F' compile_native_go_fuzzer vendor
 
-# Remove windows test to avoid double declarations:
-rm ./client_windows_test_fuzz.go
-rm ./helpers_windows_test_fuzz.go
+cp $SRC/containerd/contrib/fuzz/*.options $OUT/
+cp $SRC/containerd/contrib/fuzz/*.dict $OUT/
 
-compile_fuzzers '^func FuzzInteg.*data' compile_go_fuzzer vendor
+# Resume CXXFLAGS
+export CXXFLAGS=$OLDCXXFLAGS

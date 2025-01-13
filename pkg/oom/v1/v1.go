@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 /*
    Copyright The containerd Authors.
@@ -24,12 +23,13 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/containerd/cgroups"
+	"github.com/containerd/cgroups/v3/cgroup1"
 	eventstypes "github.com/containerd/containerd/api/events"
-	"github.com/containerd/containerd/pkg/oom"
-	"github.com/containerd/containerd/runtime"
-	"github.com/containerd/containerd/runtime/v2/shim"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/containerd/v2/pkg/oom"
+	"github.com/containerd/containerd/v2/pkg/shim"
+	"github.com/containerd/containerd/v2/pkg/sys"
+	"github.com/containerd/log"
 	"golang.org/x/sys/unix"
 )
 
@@ -58,7 +58,7 @@ type epoller struct {
 
 type item struct {
 	id string
-	cg cgroups.Cgroup
+	cg cgroup1.Cgroup
 }
 
 // Close the epoll fd
@@ -68,30 +68,38 @@ func (e *epoller) Close() error {
 
 // Run the epoll loop
 func (e *epoller) Run(ctx context.Context) {
-	var events [128]unix.EpollEvent
+	var (
+		n      int
+		err    error
+		events [128]unix.EpollEvent
+	)
 	for {
-		select {
-		case <-ctx.Done():
-			e.Close()
-			return
-		default:
-			n, err := unix.EpollWait(e.fd, events[:], -1)
-			if err != nil {
-				if err == unix.EINTR {
-					continue
-				}
-				logrus.WithError(err).Error("cgroups: epoll wait")
+		err = sys.IgnoringEINTR(func() error {
+			select {
+			case <-ctx.Done():
+				e.Close()
+				return ctx.Err()
+			default:
+				n, err = unix.EpollWait(e.fd, events[:], -1)
+				return err
 			}
-			for i := 0; i < n; i++ {
-				e.process(ctx, uintptr(events[i].Fd))
+		})
+		if err != nil {
+			if err == context.DeadlineExceeded || err == context.Canceled {
+				return
 			}
+			log.G(ctx).WithError(err).Error("cgroups: epoll wait")
+		}
+
+		for i := 0; i < n; i++ {
+			e.process(ctx, uintptr(events[i].Fd))
 		}
 	}
 }
 
 // Add cgroups.Cgroup to the epoll monitor
 func (e *epoller) Add(id string, cgx interface{}) error {
-	cg, ok := cgx.(cgroups.Cgroup)
+	cg, ok := cgx.(cgroup1.Cgroup)
 	if !ok {
 		return fmt.Errorf("expected cgroups.Cgroup, got: %T", cgx)
 	}
@@ -121,7 +129,7 @@ func (e *epoller) process(ctx context.Context, fd uintptr) {
 		return
 	}
 	e.mu.Unlock()
-	if i.cg.State() == cgroups.Deleted {
+	if i.cg.State() == cgroup1.Deleted {
 		e.mu.Lock()
 		delete(e.set, fd)
 		e.mu.Unlock()
@@ -131,7 +139,7 @@ func (e *epoller) process(ctx context.Context, fd uintptr) {
 	if err := e.publisher.Publish(ctx, runtime.TaskOOMEventTopic, &eventstypes.TaskOOM{
 		ContainerID: i.id,
 	}); err != nil {
-		logrus.WithError(err).Error("publish OOM event")
+		log.G(ctx).WithError(err).Error("publish OOM event")
 	}
 }
 
